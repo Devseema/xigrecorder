@@ -12,9 +12,49 @@ function formatSecs(s) {
 function niceBytes(n) {
   if (!n && n !== 0) return "";
   if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(n / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  if (n < 1024*1024) return `${(n/1024).toFixed(1)} KB`;
+  if (n < 1024*1024*1024) return `${(n/(1024*1024)).toFixed(1)} MB`;
+  return `${(n/(1024*1024*1024)).toFixed(1)} GB`;
+}
+
+/* Use a simple localStorage-backed counter for guest usage.
+   Keys:
+    - xig_guest_count  (number of recordings used when not logged in)
+    - xig_user_email   (when logged in)
+    - xig_user_count   (number of recordings used while logged in)
+*/
+function getGuestCount() {
+  return Number(localStorage.getItem('xig_guest_count') || 0);
+}
+function incGuestCount() {
+  const v = getGuestCount() + 1;
+  localStorage.setItem('xig_guest_count', String(v));
+  return v;
+}
+function resetGuestCount() {
+  localStorage.setItem('xig_guest_count','0');
+}
+function getUserEmail() {
+  return localStorage.getItem('xig_user_email') || null;
+}
+function setUserEmail(e) {
+  if (e) localStorage.setItem('xig_user_email', e);
+  else localStorage.removeItem('xig_user_email');
+}
+function getUserCount() {
+  return Number(localStorage.getItem('xig_user_count') || 0);
+}
+function incUserCount() {
+  const v = getUserCount() + 1;
+  localStorage.setItem('xig_user_count', String(v));
+  return v;
+}
+function resetUserCount() {
+  localStorage.setItem('xig_user_count', '0');
+}
+function logoutUser() {
+  setUserEmail(null);
+  resetUserCount();
 }
 
 /* --- App --- */
@@ -31,7 +71,13 @@ export default function App() {
   const [seconds, setSeconds] = useState(0);
   const [toasts, setToasts] = useState([]);
   const [recordings, setRecordings] = useState([]);
-  const [usageInfo, setUsageInfo] = useState(null);
+
+  const [accountPanelOpen, setAccountPanelOpen] = useState(false);
+  const [accountEmail, setAccountEmail] = useState(getUserEmail() || "");
+  const [otpSent, setOtpSent] = useState(false);
+  const [otpValue, setOtpValue] = useState("");
+  const [guestCount, setGuestCountState] = useState(getGuestCount());
+  const [userCount, setUserCountState] = useState(getUserCount());
 
   const previewRef = useRef(null);
   const mediaRecorderRef = useRef(null);
@@ -46,7 +92,6 @@ export default function App() {
   const mixerDestinationRef = useRef(null);
 
   const lastStartTimeRef = useRef(null);
-
   const toastIdRef = useRef(1);
 
   useEffect(() => {
@@ -54,57 +99,31 @@ export default function App() {
     loadSources();
     enumerateMics();
     loadRecordings();
-    loadUsageInfo();
+
+    // set account email from localStorage if present
+    setAccountEmail(getUserEmail() || "");
 
     return () => {
       if (timerRef.current) clearInterval(timerRef.current);
       if (pendingDisplayStreamRef.current) {
-        try { pendingDisplayStreamRef.current.getTracks().forEach(t => t.stop()); } catch (_) {}
+        try { pendingDisplayStreamRef.current.getTracks().forEach(t=>t.stop()); } catch(_) {}
       }
       if (audioContextRef.current) {
-        try { audioContextRef.current.close(); } catch (_) {}
+        try { audioContextRef.current.close(); } catch(_) {}
       }
     };
     // eslint-disable-next-line
   }, []);
 
+  useEffect(() => {
+    setGuestCountState(getGuestCount());
+    setUserCountState(getUserCount());
+  }, [toasts]);
+
   function addToast(text, kind = "neutral") {
     const id = toastIdRef.current++;
     setToasts(s => [...s, { id, text, kind }]);
     setTimeout(() => setToasts(s => s.filter(x => x.id !== id)), 3500);
-  }
-
-  /* -------- Usage API -------- */
-  async function loadUsageInfo() {
-    if (!window.electronAPI || !window.electronAPI.getUsageInfo) return;
-    try {
-      const info = await window.electronAPI.getUsageInfo();
-      setUsageInfo(info || null);
-    } catch (e) {
-      console.warn("loadUsageInfo failed", e);
-    }
-  }
-
-  async function canRecord() {
-    // If no electron API available, allow (browser fallback)
-    if (!window.electronAPI || !window.electronAPI.getUsageInfo) return true;
-    try {
-      const info = await window.electronAPI.getUsageInfo();
-      setUsageInfo(info || null);
-
-      if (!info.isLoggedIn && (info.freeCount || 0) >= 5) {
-        addToast("Guest limit reached (5). Please log in to continue.", "warn");
-        return false;
-      }
-      if (info.isLoggedIn && !info.isSubscribed && (info.userCount || 0) >= 10) {
-        addToast("Limit reached (10 recordings). Please subscribe to continue.", "warn");
-        return false;
-      }
-      return true;
-    } catch (e) {
-      console.warn("canRecord check failed", e);
-      return true;
-    }
   }
 
   /* -------- Source & Mic enumerate -------- */
@@ -154,7 +173,6 @@ export default function App() {
     await loadSources();
     await enumerateMics();
     await loadRecordings();
-    await loadUsageInfo();
     addToast("Refreshed", "ok");
   }
 
@@ -163,7 +181,7 @@ export default function App() {
     async function tryG(constraint) {
       try {
         const s = await navigator.mediaDevices.getUserMedia({ audio: constraint, video: false });
-        console.log("getMicStream success constraint:", constraint, "tracks:", s.getAudioTracks().map(t => ({ id: t.id, label: t.label })));
+        console.log("getMicStream success constraint:", constraint, "tracks:", s.getAudioTracks().map(t=>({id:t.id,label:t.label})));
         return s;
       } catch (err) {
         console.warn("getMicStream fail for", constraint, err);
@@ -177,26 +195,58 @@ export default function App() {
       if (!labelsShown) {
         try {
           await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-          await new Promise(r => setTimeout(r, 120));
-        } catch (e) { console.warn('priming mic permission failed', e); }
+          await new Promise(r=>setTimeout(r,120));
+        } catch(e) { console.warn('priming mic permission failed', e); }
       }
-    } catch (e) { console.warn('enumerate in priming failed', e); }
+    } catch(e) { console.warn('enumerate in priming failed', e); }
 
     if (selectedId && selectedId !== 'default' && selectedId !== 'communications') {
-      try { return await tryG({ deviceId: { exact: selectedId } }); } catch (e) { console.warn('exact device try failed', e); }
+      try { return await tryG({ deviceId: { exact: selectedId } }); } catch(e) { console.warn('exact device try failed', e); }
     }
     if (selectedId && selectedId !== 'default' && selectedId !== 'communications') {
-      try { return await tryG({ deviceId: selectedId }); } catch (e) { console.warn('non-exact device try failed', e); }
+      try { return await tryG({ deviceId: selectedId }); } catch(e) { console.warn('non-exact device try failed', e); }
     }
     return await tryG(true);
   }
 
-  /* -------- Picker + countdown + start/stop -------- */
+  /* -------- Recording limits logic (guest/login) -------- */
+  // limits stored centrally as config
+  const LIMITS = {
+    guestFree: 5,
+    loggedInFree: 10
+  };
 
-  // Wrapper to check usage then start countdown/recording
+  function canStartRecording() {
+    const email = getUserEmail();
+    if (!email) {
+      return getGuestCount() < LIMITS.guestFree;
+    } else { 
+      const guestUsed = getGuestCount();
+      const userUsed = getUserCount();
+      return (guestUsed + userUsed) < LIMITS.loggedInFree;
+    }
+  }
+
+  function noteRecordingSaved() {
+    const email = getUserEmail();
+    if (!email) {
+      const newCount = incGuestCount();
+      setGuestCountState(newCount);
+    } else {
+      const newCount = incUserCount();
+      setUserCountState(newCount);
+    }
+  }
+
+  /* -------- Picker + countdown + start/stop -------- */
   const commenceStartRecording = async () => {
-    const ok = await canRecord();
-    if (!ok) return;
+    // check limits
+    if (!canStartRecording()) {
+      // open account panel (login)
+      setAccountPanelOpen(true);
+      addToast('Guest limit reached (5). Please log in to continue.', 'warn');
+      return;
+    }
 
     if (!selectedSourceId) { addToast("Select a source", "warn"); setStatus("Select a source"); return; }
 
@@ -224,7 +274,7 @@ export default function App() {
     setCountdown(3);
     setStatus("Starting in 3s...");
     addToast("Recording starts in 3s", "neutral");
-    const id = setInterval(() => {
+    const id = setInterval(()=> {
       setCountdown(c => {
         if (c <= 1) { clearInterval(id); setCountdown(0); startRecording(); return 0; }
         return c - 1;
@@ -239,7 +289,7 @@ export default function App() {
         console.log('TRACK.ONENDED', track.kind, track.label);
         setTimeout(() => {
           if (!recording) {
-            try { if (pendingDisplayStreamRef.current) pendingDisplayStreamRef.current.getTracks().forEach(t => t.stop()); } catch (_) {}
+            try { if (pendingDisplayStreamRef.current) pendingDisplayStreamRef.current.getTracks().forEach(t=>t.stop()); } catch(_) {}
             pendingDisplayStreamRef.current = null;
           } else {
             const started = lastStartTimeRef.current || 0;
@@ -268,7 +318,7 @@ export default function App() {
     const ac = audioContextRef.current;
 
     if (mixerDestinationRef.current) {
-      try { mixerDestinationRef.current.disconnect(); } catch (_) {}
+      try { mixerDestinationRef.current.disconnect(); } catch(_) {}
       mixerDestinationRef.current = null;
     }
 
@@ -363,7 +413,7 @@ export default function App() {
         streamsRef.current = { screenStream, audioStream: micStream, combined };
       }
 
-      console.log("Combined tracks before recording:", combined.getTracks().map(t => ({ kind: t.kind, label: t.label, id: t.id })));
+      console.log("Combined tracks before recording:", combined.getTracks().map(t=>({kind:t.kind,label:t.label,id:t.id})));
       if (combined.getAudioTracks().length === 0) {
         console.warn("No audio tracks in combined stream");
         addToast("No audio present — check mic permissions or capture mode", "warn");
@@ -373,7 +423,7 @@ export default function App() {
       if (previewRef.current) {
         previewRef.current.srcObject = combined;
         previewRef.current.muted = true;
-        try { await previewRef.current.play(); } catch (_) {}
+        try { await previewRef.current.play(); } catch(_) {}
       }
 
       // recorder options (prefer vp8)
@@ -396,7 +446,7 @@ export default function App() {
         setStatus("Recording...");
         addToast("Recording started", "recording");
         setSeconds(0);
-        timerRef.current = setInterval(() => setSeconds(s => s + 1), 1000);
+        timerRef.current = setInterval(()=>setSeconds(s=>s+1), 1000);
       };
 
       mr.onstop = async () => {
@@ -406,8 +456,8 @@ export default function App() {
         addToast("Saving recording...", "neutral");
 
         const blob = new Blob(chunksRef.current, { type: 'video/webm' });
-        const filename = `xigrecorder_${new Date().toISOString().replace(/[:.]/g, '-')}.webm`;
-        const approxSize = chunksRef.current.reduce((s, c) => s + (c.size || 0), 0);
+        const filename = `xigrecorder_${new Date().toISOString().replace(/[:.]/g,'-')}.webm`;
+        const approxSize = chunksRef.current.reduce((s,c)=>s+(c.size||0), 0);
         console.log('Approx bytes:', approxSize, 'chunks:', chunksRef.current.length);
 
         try {
@@ -418,15 +468,8 @@ export default function App() {
             if (res && res.success) {
               addToast("Saved to Videos", "ok");
               setStatus("Saved: " + res.path + ` (${niceBytes(res.size || approxSize)})`);
-              // increment usage count now that a recording was saved
-              try {
-                if (window.electronAPI && typeof window.electronAPI.incrementRecording === 'function') {
-                  await window.electronAPI.incrementRecording();
-                  await loadUsageInfo();
-                }
-              } catch (ie) {
-                console.warn('incrementRecording failed', ie);
-              }
+              // note usage increment here
+              noteRecordingSaved();
             } else {
               addToast("Save failed", "error");
               setStatus("Save failed: " + (res && res.error));
@@ -442,6 +485,7 @@ export default function App() {
             URL.revokeObjectURL(url);
             addToast("Downloaded (browser)", "ok");
             setStatus("Downloaded (browser)");
+            noteRecordingSaved();
           }
         } catch (err) {
           console.error('save error', err);
@@ -455,17 +499,17 @@ export default function App() {
           streamsRef.current?.audioStream?.getTracks()?.forEach(t => t.stop());
           if (previewRef.current) { previewRef.current.pause(); previewRef.current.srcObject = null; }
           if (mixerDestinationRef.current) {
-            try { mixerDestinationRef.current.disconnect(); } catch (_) {}
+            try { mixerDestinationRef.current.disconnect(); } catch(_) {}
             mixerDestinationRef.current = null;
           }
-        } catch (e) { }
+        } catch (e) {}
         streamsRef.current = null;
         // reload recordings list
         loadRecordings();
       };
 
       // small delay to avoid immediate empty recording
-      await new Promise(r => setTimeout(r, 200));
+      await new Promise(r=>setTimeout(r, 200));
 
       try {
         if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'inactive') {
@@ -481,7 +525,7 @@ export default function App() {
       console.error('startRecording error', err);
       addToast('Start failed: ' + (err && err.message), 'error');
       setStatus('Start failed: ' + (err && err.message));
-      try { if (pendingDisplayStreamRef.current) { pendingDisplayStreamRef.current.getTracks().forEach(t => t.stop()); pendingDisplayStreamRef.current = null; } } catch (e) { }
+      try { if (pendingDisplayStreamRef.current) { pendingDisplayStreamRef.current.getTracks().forEach(t=>t.stop()); pendingDisplayStreamRef.current = null; } } catch(e){}
     }
   }
 
@@ -513,8 +557,66 @@ export default function App() {
     try {
       const res = await window.electronAPI.openRecordingsFolder();
       if (res && res.success) addToast("Opened folder", "ok");
-    } catch (e) { console.warn(e); addToast("Could not open folder", "error"); }
+    } catch(e) { console.warn(e); addToast("Could not open folder", "error"); }
   };
+
+  /* -------- OTP / account flow (renderer side) -------- */
+
+  async function sendOtpToEmail(email) {
+    if (!window.electronAPI || !window.electronAPI.sendOtp) {
+      addToast("OTP sending not available (not in Electron)", "error");
+      return { success: false, error: 'not-available' };
+    }
+    try {
+      const res = await window.electronAPI.sendOtp(email);
+      if (res && res.success) {
+        setOtpSent(true);
+        addToast('OTP sent to ' + email, 'ok');
+        return { success: true };
+      } else {
+        addToast('OTP send failed: ' + (res && res.error), 'error');
+        return { success: false, error: res && res.error };
+      }
+    } catch (err) {
+      console.error('sendOtpToEmail error', err);
+      addToast('OTP send error: ' + (err.message || err), 'error');
+      return { success: false, error: err && err.message };
+    }
+  }
+
+  async function verifyOtpForEmail(email, code) {
+    if (!window.electronAPI || !window.electronAPI.verifyOtp) {
+      addToast("OTP verify not available (not in Electron)", "error");
+      return { success: false, error: 'not-available' };
+    }
+    try {
+      const res = await window.electronAPI.verifyOtp(email, code);
+      if (res && res.success) {
+        // store user as logged in
+        setUserEmail(email);
+        addToast('Logged in as ' + email, 'ok');
+        setAccountPanelOpen(false);
+        setOtpSent(false);
+        setOtpValue('');
+        setUserCountState(getUserCount());
+        return { success: true };
+      } else {
+        addToast('OTP verify failed: ' + (res && res.error), 'error');
+        return { success: false, error: res && res.error };
+      }
+    } catch (err) {
+      console.error('verifyOtpForEmail error', err);
+      addToast('OTP verify error: ' + (err.message || err), 'error');
+      return { success: false, error: err && err.message };
+    }
+  }
+
+  /* Testing helper: reset guest count (button shown only in dev/test) */
+  function handleResetGuestCount() {
+    resetGuestCount();
+    setGuestCountState(0);
+    addToast('Guest count reset', 'ok');
+  }
 
   /* -------- Render -------- */
   return (
@@ -524,19 +626,19 @@ export default function App() {
           <h1 className="brand">XigRecorder</h1>
           <div className="subtitle">Screen + Microphone recorder — desktop app</div>
         </div>
-        <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+        <div style={{display:'flex',gap:12,alignItems:'center'}}>
           <button className="mini" onClick={refreshAll}>Refresh</button>
           <button className="mini" onClick={openRecordingsFolder}>Open Videos</button>
+          <button className="mini" onClick={() => setAccountPanelOpen(s=>!s)}>{getUserEmail() ? 'Account' : 'Login / Signup'}</button>
         </div>
       </header>
 
       <main className="xr-main app-main">
-        {/* LEFT PANE: sources and controls (scrollable) */}
+        {/* LEFT PANE */}
         <div className="left-pane">
-
           <div className="card sources-card">
             <div className="card-title">Source</div>
-            <div className="sources-grid" aria-label="source list">
+            <div className="sources-grid" aria-label="source list" style={{maxHeight: '320px', overflowY:'auto'}}>
               {sources.length === 0 && <div className="empty">No sources found</div>}
               {sources.map(s => (
                 <button
@@ -555,7 +657,7 @@ export default function App() {
           </div>
 
           <div className="card controls-card">
-            <div className="row" style={{ alignItems: 'center' }}>
+            <div className="row" style={{alignItems:'center'}}>
               <label>Capture</label>
               <select value={captureMode} onChange={e => setCaptureMode(e.target.value)}>
                 <option value="video+mic">Video + Microphone</option>
@@ -564,7 +666,7 @@ export default function App() {
                 <option value="video+system">Video + System audio</option>
               </select>
 
-              <label style={{ marginLeft: 12 }}>Microphone</label>
+              <label style={{marginLeft:12}}>Microphone</label>
               <select value={selectedMicId} onChange={e => setSelectedMicId(e.target.value)}>
                 <option value="">Default microphone</option>
                 {micDevices.map(m => <option key={m.deviceId} value={m.deviceId}>{m.label || m.deviceId}</option>)}
@@ -572,14 +674,14 @@ export default function App() {
 
               <button className="mini" onClick={enumerateMics}>Refresh Mics</button>
 
-              <div style={{ marginLeft: 'auto' }}>
-                <div style={{ color: '#9aa7b0' }}>{status}</div>
+              <div style={{marginLeft:'auto'}}>
+                <div style={{color:'#9aa7b0'}}>{status}</div>
               </div>
             </div>
 
-            <div className="row actions" style={{ marginTop: 12 }}>
+            <div className="row actions" style={{marginTop:12}}>
               {countdown > 0 ? (
-                <div style={{ fontSize: 18, fontWeight: 700 }}>Starting in {countdown}...</div>
+                <div style={{fontSize:18, fontWeight:700}}>Starting in {countdown}...</div>
               ) : (
                 <>
                   <button className="primary" onClick={commenceStartRecording} disabled={recording}>Start Recording</button>
@@ -587,32 +689,25 @@ export default function App() {
                 </>
               )}
 
-              <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 12 }}>
+              <div style={{marginLeft:'auto', display:'flex',alignItems:'center',gap:12}}>
                 {recording ? <div className="record-indicator"><span className="dot" /> {formatSecs(seconds)}</div> : null}
                 <div className="save-msg" title={status}>{status}</div>
               </div>
             </div>
 
-            <div className="small-note" style={{ marginTop: 12 }}>
-              Files saved to your system <strong>Videos</strong> folder (Electron). In browser they download to your Downloads folder.
+            <div style={{marginTop:12, display:'flex', gap:10, alignItems:'center'}}>
+              <div className="small-note">Files saved to your system <strong>Videos</strong> folder (Electron). In browser they download to your Downloads folder.</div>
+              <div style={{marginLeft:'auto', color:'#9aa7b0'}}>Sources loaded (desktop)</div>
             </div>
 
-            {/* Usage info */}
-            <div style={{ marginTop: 8, color: '#9aa7b0', fontSize: 13 }}>
-              {usageInfo ? (
-                usageInfo.isLoggedIn ? (
-                  usageInfo.isSubscribed ? "Subscribed user: unlimited recordings" :
-                    `Logged in: ${usageInfo.userCount || 0}/10 recordings used`
-                ) : (
-                  `Guest: ${usageInfo.freeCount || 0}/5 recordings used`
-                )
-              ) : null}
+            <div style={{marginTop:12}}>
+              <button className="mini" onClick={handleResetGuestCount}>Reset Guest Count (test)</button>
+              <div style={{marginTop:8, color:'#9aa7b0'}}>Guest used {guestCount} / 5. Logged-in additional used {userCount}</div>
             </div>
           </div>
-
         </div>
 
-        {/* RIGHT PANE: sticky preview + recordings */}
+        {/* RIGHT PANE */}
         <div className="right-pane">
           <div className="right-sticky">
             <div className="card preview-card">
@@ -625,10 +720,10 @@ export default function App() {
 
             <div className="card recordings-card">
               <div className="card-title">Recordings</div>
-              <div className="recordings-list">
+              <div className="recordings-list" style={{maxHeight: 240, overflowY:'auto'}}>
                 <RecordingsList recordings={recordings} onReveal={() => { loadRecordings(); }} />
               </div>
-              <div className="recordings-actions" style={{ marginTop: 10 }}>
+              <div className="recordings-actions" style={{marginTop:10}}>
                 <button className="mini" onClick={loadRecordings}>Refresh list</button>
                 <button className="mini" onClick={openRecordingsFolder}>Open folder</button>
               </div>
@@ -637,6 +732,62 @@ export default function App() {
         </div>
 
       </main>
+
+      {/* Account panel (modal-ish) */}
+      {accountPanelOpen && (
+        <div style={{
+          position:'fixed', left:0, right:0, top:0, bottom:0,
+          display:'flex', alignItems:'center', justifyContent:'center', zIndex:3000,
+          background:'rgba(0,0,0,0.5)'
+        }}>
+          <div style={{width:420, background:'#0b1520', borderRadius:12, padding:18, boxShadow:'0 8px 30px rgba(0,0,0,0.6)'}}>
+            <div style={{display:'flex', justifyContent:'space-between', alignItems:'center'}}>
+              <div style={{fontWeight:700, fontSize:18}}>Account</div>
+              <div style={{cursor:'pointer'}} onClick={()=>setAccountPanelOpen(false)}>Close</div>
+            </div>
+
+            <div style={{marginTop:12}}>
+              <div style={{color:'#9aa7b0'}}>Logged in: {getUserEmail() || 'Guest'}</div>
+              <div style={{marginTop:12}}>
+                <input type="email" placeholder="Email" value={accountEmail} onChange={e=>setAccountEmail(e.target.value)} style={{width:'100%', padding:10, borderRadius:8, border:'1px solid rgba(255,255,255,0.04)', background:'#070b0f', color:'#fff'}} />
+                <div style={{display:'flex', gap:8, marginTop:8}}>
+                  <button className="primary" onClick={async ()=>{
+                    if (!accountEmail) return addToast('Enter email', 'warn');
+                    const res = await sendOtpToEmail(accountEmail);
+                    if (res.success) {
+                      // OTP sent; show input (we set otpSent true already)
+                    }
+                  }}>Send OTP</button>
+                  <button className="secondary" onClick={()=>{
+                    setAccountEmail('');
+                    setOtpValue('');
+                    setOtpSent(false);
+                  }}>Clear</button>
+                </div>
+
+                {otpSent && (
+                  <div style={{marginTop:12}}>
+                    <input placeholder="Enter OTP" value={otpValue} onChange={e=>setOtpValue(e.target.value)} style={{width:'100%', padding:10, borderRadius:8, border:'1px solid rgba(255,255,255,0.04)', background:'#070b0f', color:'#fff'}} />
+                    <div style={{display:'flex', gap:8, marginTop:8}}>
+                      <button className="primary" onClick={async ()=>{
+                        const res = await verifyOtpForEmail(accountEmail, otpValue);
+                        if (res.success) {
+                          setAccountPanelOpen(false);
+                          setAccountEmail(accountEmail);
+                        }
+                      }}>Verify OTP</button>
+                      <button className="mini" onClick={()=>{ setOtpValue(''); }}>Clear</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div style={{marginTop:12, color:'#9aa7b0'}}>For now login/signup is simulated. Once verified you'll be able to record extra times (total 10 recordings).</div>
+
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="toasts">
         {toasts.map(t => <div key={t.id} className={`toast ${t.kind || ''}`}>{t.text}</div>)}

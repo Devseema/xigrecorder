@@ -1,83 +1,10 @@
-// xigrecorder/main/index.js
+// main/index.js
+require('dotenv').config(); // load .env in main process
 const { app, BrowserWindow, ipcMain, desktopCapturer, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const Store = require('electron-store');
 
-/* ---------------------------
-   Persistent usage limits
-   --------------------------- */
-// const store = new Store({
-//   name: 'xigrecorder-store',
-//   defaults: {
-//     freeCount: 0,       // guest recordings used (max 5)
-//     userCount: 0,       // logged-in recordings used (max 10 unless subscribed)
-//     isLoggedIn: false,  // toggle via login flow later
-//     isSubscribed: false // toggle via payment later
-//   }
-// });
-// --- robust store setup (supports electron-store or a JSON fallback) ---
-let store = null;
-try {
-  // attempt to require electron-store
-  const StorePkg = require('electron-store');
-  // handle both commonjs function export and possible default interop
-  const StoreCtor = (typeof StorePkg === 'function') ? StorePkg : (StorePkg && StorePkg.default) ? StorePkg.default : null;
-  if (StoreCtor) {
-    store = new StoreCtor({
-      name: 'xigrecorder-store',
-      defaults: {
-        freeCount: 0,
-        userCount: 0,
-        isLoggedIn: false,
-        isSubscribed: false
-      }
-    });
-    console.log('Using electron-store for persistent settings.');
-  } else {
-    console.warn('electron-store present but not constructor; falling back to JSON store.');
-  }
-} catch (err) {
-  console.warn('electron-store not available or failed to load; falling back to JSON store:', err && err.message);
-}
-
-// If electron-store not available or failed, use a minimal JSON-file store
-if (!store) {
-  // file in userData so it is per-user and writable
-  const storeFile = path.join(app.getPath('userData') || app.getPath('home'), 'xigrecorder-store.json');
-  let data = { freeCount: 0, userCount: 0, isLoggedIn: false, isSubscribed: false };
-
-  try {
-    if (fs.existsSync(storeFile)) {
-      const txt = fs.readFileSync(storeFile, 'utf8');
-      if (txt) data = Object.assign(data, JSON.parse(txt));
-    } else {
-      // write initial file
-      try { fs.writeFileSync(storeFile, JSON.stringify(data, null, 2), 'utf8'); } catch(_) {}
-    }
-  } catch (e) {
-    console.warn('Could not read/write fallback store file:', e && e.message);
-  }
-
-  // mimic the electron-store API surface used by the app:
-  store = {
-    get: (k, def) => (typeof k === 'undefined' ? data : (k in data ? data[k] : def)),
-    set: (k, v) => {
-      try {
-        data[k] = v;
-        fs.writeFileSync(storeFile, JSON.stringify(data, null, 2), 'utf8');
-      } catch (e) {
-        console.warn('Failed to write fallback store file:', e && e.message);
-      }
-      return data;
-    },
-    // convenience to inspect the whole store
-    store: data
-  };
-
-  console.log('Using fallback JSON store at', storeFile);
-}
-
+console.log('MAIN starting, env BREVO_FROM_EMAIL present?', !!process.env.BREVO_FROM_EMAIL);
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -114,10 +41,11 @@ function createWindow() {
 
 app.whenReady().then(createWindow);
 
-/* ---------------------------
-   Robust save-video handler
-   (unchanged behavior)
-   --------------------------- */
+/* ===========================
+   File save / desktop capture
+   =========================== */
+
+// Robust save-video handler (accepts ArrayBuffer / TypedArray / Buffer / base64 / structured clone)
 ipcMain.handle('save-video', async (event, { buffer, filename }) => {
   try {
     if (!filename || typeof filename !== 'string') throw new Error('Invalid filename');
@@ -170,9 +98,7 @@ ipcMain.handle('save-video', async (event, { buffer, filename }) => {
   }
 });
 
-/* ---------------------------
-   Desktop sources
-   --------------------------- */
+// Provide desktop sources via main (desktopCapturer available here)
 ipcMain.handle('desktop-get-sources', async (event, opts = { types: ['screen', 'window'] }) => {
   try {
     const sources = await desktopCapturer.getSources(opts);
@@ -188,9 +114,7 @@ ipcMain.handle('desktop-get-sources', async (event, opts = { types: ['screen', '
   }
 });
 
-/* ---------------------------
-   Recordings helpers
-   --------------------------- */
+// Recordings helpers (list, open folder, reveal file)
 ipcMain.handle('list-recordings', async () => {
   try {
     const videosPath = app.getPath('videos');
@@ -234,45 +158,113 @@ ipcMain.handle('reveal-recording', async (event, fullPath) => {
   }
 });
 
-/* ---------------------------
-   USAGE LIMITS API
-   --------------------------- */
-// Get current usage info
-ipcMain.handle('get-usage-info', async () => ({
-  freeCount: store.get('freeCount', 0),
-  userCount: store.get('userCount', 0),
-  isLoggedIn: store.get('isLoggedIn', false),
-  isSubscribed: store.get('isSubscribed', false)
-}));
+/* ===================================
+   OTP sending / verification (Brevo)
+   =================================== */
 
-// Called AFTER a successful recording is saved
-ipcMain.handle('increment-recording-count', async () => {
-  if (!store.get('isLoggedIn')) {
-    const next = (store.get('freeCount', 0) || 0) + 1;
-    store.set('freeCount', next);
-    return { mode: 'guest', count: next, max: 5 };
-  } else {
-    const next = (store.get('userCount', 0) || 0) + 1;
-    store.set('userCount', next);
-    const max = store.get('isSubscribed') ? Infinity : 10;
-    return { mode: 'user', count: next, max };
+// configuration from env
+const BREVO_API_KEY = process.env.BREVO_API_KEY || process.env.APIKEY || process.env.BREVO_KEY;
+const BREVO_FROM_EMAIL = process.env.BREVO_FROM_EMAIL || process.env.BREVO_FROM || 'no-reply@example.com';
+const BREVO_FROM_NAME = process.env.BREVO_FROM_NAME || 'XigRecorder';
+const OTP_TTL = Number(process.env.OTP_TTL_SECONDS || 300); // seconds
+
+if (!BREVO_API_KEY) {
+  console.warn('BREVO_API_KEY not found in env. OTP emailing will fail until set.');
+}
+
+// in-memory OTP map: email -> { code, expiresAt }
+const OTP_STORE = new Map();
+
+// helper to generate 6-digit OTP
+function genOtp() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+// helper to send via Brevo using fetch (node v18+ has global fetch, else try node-fetch)
+async function sendBrevoEmail({ toEmail, subject, htmlContent, textContent }) {
+  if (!BREVO_API_KEY) throw new Error('No BREVO API key configured (BREVO_API_KEY)');
+
+  // try global fetch, else require node-fetch
+  let _fetch = global.fetch;
+  if (typeof _fetch !== 'function') {
+    try {
+      _fetch = require('node-fetch');
+    } catch (e) {
+      throw new Error('fetch not available and node-fetch not installed');
+    }
+  }
+
+  const url = 'https://api.brevo.com/v3/smtp/email';
+  const body = {
+    sender: { name: BREVO_FROM_NAME, email: BREVO_FROM_EMAIL },
+    to: [{ email: toEmail }],
+    subject: subject,
+    htmlContent: htmlContent,
+    textContent: textContent
+  };
+
+  const res = await _fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'api-key': BREVO_API_KEY
+    },
+    body: JSON.stringify(body)
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Brevo API error ${res.status}: ${text}`);
+  }
+  const json = await res.json();
+  return json;
+}
+
+ipcMain.handle('send-otp', async (event, { email }) => {
+  try {
+    if (!email || typeof email !== 'string') throw new Error('Invalid email');
+
+    const code = genOtp();
+    const expiresAt = Date.now() + OTP_TTL * 1000;
+    OTP_STORE.set(email, { code, expiresAt });
+
+    const subject = 'Your XigRecorder OTP';
+    const htmlContent = `<p>Hello —</p><p>Your XigRecorder OTP is <strong>${code}</strong>. It expires in ${Math.floor(OTP_TTL/60)} minutes.</p><p>If you didn't request this, ignore this email.</p>`;
+    const textContent = `Your XigRecorder OTP is ${code}. Expires in ${Math.floor(OTP_TTL/60)} minutes.`;
+
+    // send email
+    await sendBrevoEmail({ toEmail: email, subject, htmlContent, textContent });
+    console.log('OTP sent to', email, 'code:', code);
+
+    return { success: true, message: 'OTP sent' };
+  } catch (err) {
+    console.error('send-otp error', err);
+    return { success: false, error: (err && err.message) || String(err) };
   }
 });
 
-// Dev/test helpers (optional)
-ipcMain.handle('reset-usage', async () => {
-  store.set('freeCount', 0);
-  store.set('userCount', 0);
-  return true;
-});
-ipcMain.handle('set-login-state', async (e, { isLoggedIn = false } = {}) => {
-  store.set('isLoggedIn', !!isLoggedIn);
-  return store.store;
-});
-ipcMain.handle('set-subscribed', async (e, { isSubscribed = false } = {}) => {
-  store.set('isSubscribed', !!isSubscribed);
-  return store.store;
+ipcMain.handle('verify-otp', async (event, { email, code }) => {
+  try {
+    if (!email || !code) throw new Error('email and code required');
+    const rec = OTP_STORE.get(email);
+    if (!rec) return { success: false, error: 'No OTP requested for this email' };
+    if (Date.now() > rec.expiresAt) {
+      OTP_STORE.delete(email);
+      return { success: false, error: 'OTP expired' };
+    }
+    if (String(rec.code) !== String(code).trim()) {
+      return { success: false, error: 'Invalid OTP' };
+    }
+    // valid -> remove OTP (one-time)
+    OTP_STORE.delete(email);
+    // return success (you may want to create a real user/session here)
+    return { success: true, message: 'OTP verified' };
+  } catch (err) {
+    console.error('verify-otp error', err);
+    return { success: false, error: (err && err.message) || String(err) };
+  }
 });
 
+/* ===== app event handlers ===== */
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });

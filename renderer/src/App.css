@@ -183,3 +183,58 @@ kbd { background: rgba(255,255,255,0.03); border-radius:6px; padding:2px 7px; fo
 
 /* final safety: ensure no horizontal overflow */
 body, .app-root, .xr-main, .left-pane, .right-pane { overflow-x: hidden; }
+/* ===== Modal / Portal styles (append to app.css) ===== */
+.xr-modal-backdrop {
+  position: fixed;
+  left: 0; top: 0; right: 0; bottom: 0;
+  background: rgba(4,8,12,0.6);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  z-index: 99999;
+  padding: 28px;
+}
+.xr-modal {
+  width: 520px;
+  max-width: 94vw;
+  max-height: 92vh;
+  background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(0,0,0,0.06));
+  border-radius: 12px;
+  box-shadow: 0 18px 60px rgba(2,6,11,0.6);
+  border: 1px solid rgba(255,255,255,0.03);
+  color: #e6eef8;
+  display:flex;
+  flex-direction:column;
+  overflow: hidden;
+}
+.xr-modal-header{
+  padding:12px 16px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  border-bottom: 1px solid rgba(255,255,255,0.02);
+  background: transparent;
+}
+.xr-modal-body{
+  padding:14px 16px;
+  overflow:auto;
+  min-height: 80px;
+}
+.xr-modal-footer{
+  padding:12px 16px;
+  border-top: 1px solid rgba(255,255,255,0.02);
+  display:flex;
+  justify-content:flex-end;
+  gap:8px;
+}
+.xr-modal-close{
+  background: rgba(255,255,255,0.03);
+  border: 1px solid rgba(255,255,255,0.03);
+  padding:6px 10px;
+  border-radius:8px;
+  color:#fff;
+  cursor:pointer;
+}
+@media (max-width:640px){
+  .xr-modal { width: 100%; height: auto; max-height: 94vh; margin: 8px; }
+}
